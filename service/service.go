@@ -8,6 +8,7 @@ import (
 	"github.com/liangdas/mqant/server"
 )
 
+// NewService NewService
 func NewService(opts ...Option) Service {
 	return newService(opts...)
 }
@@ -145,7 +146,5 @@ func (s *service) Run() error {
 
 	// exit reg loop
 	close(ex)
-
-	//return s.Stop()
-	return nil
+	return s.Stop()
 }

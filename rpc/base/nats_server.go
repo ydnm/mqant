@@ -31,7 +31,8 @@ type NatsServer struct {
 	addr      string
 	app       module.App
 	server    *RPCServer
-	done      chan error
+	done      chan bool
+	stopeds   chan bool
 	isClose   bool
 }
 
@@ -55,23 +56,41 @@ func setAddrs(addrs []string) []string {
 func NewNatsServer(app module.App, s *RPCServer) (*NatsServer, error) {
 	server := new(NatsServer)
 	server.server = s
-	server.done = make(chan error)
+	server.done = make(chan bool)
+	server.stopeds = make(chan bool)
 	server.isClose = false
 	server.app = app
 	server.addr = nats.NewInbox()
-	go server.on_request_handle()
+	go func() {
+		server.on_request_handle()
+		safeClose(server.stopeds)
+	}()
 	return server, nil
 }
 func (s *NatsServer) Addr() string {
 	return s.addr
 }
 
+func safeClose(ch chan bool) {
+	defer func() {
+		if recover() != nil {
+			// close(ch) panic occur
+		}
+	}()
+
+	close(ch) // panic if ch is closed
+}
+
 /**
 注销消息队列
 */
 func (s *NatsServer) Shutdown() (err error) {
-	s.done <- nil
+	safeClose(s.done)
 	s.isClose = true
+	select {
+	case <-s.stopeds:
+		//等待nats注销完成
+	}
 	return
 }
 
@@ -108,7 +127,10 @@ func (s *NatsServer) on_request_handle() error {
 	}
 
 	go func() {
-		<-s.done
+		select {
+		case <-s.done:
+			//服务关闭
+		}
 		subs.Unsubscribe()
 	}()
 
@@ -119,15 +141,14 @@ func (s *NatsServer) on_request_handle() error {
 			//log.Warning("NatsServer error with '%v'",err)
 			continue
 		} else if err != nil {
-			fmt.Println(fmt.Sprintf("%v rpcserver error: %v", time.Now().String(), err.Error()))
-			log.Error("NatsServer error with '%v'", err)
+			log.Warning("NatsServer error with '%v'", err)
 			continue
 		}
 
 		rpcInfo, err := s.Unmarshal(m.Data)
 		if err == nil {
 			callInfo := &mqrpc.CallInfo{
-				RpcInfo: *rpcInfo,
+				RPCInfo: *rpcInfo,
 			}
 			callInfo.Props = map[string]interface{}{
 				"reply_to": rpcInfo.ReplyTo,
@@ -140,7 +161,6 @@ func (s *NatsServer) on_request_handle() error {
 			fmt.Println("error ", err)
 		}
 	}
-
 	return nil
 }
 

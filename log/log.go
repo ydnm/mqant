@@ -11,6 +11,8 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+
+// Package log 日志初始化
 package log
 
 import (
@@ -21,12 +23,17 @@ import (
 var beego *beegolog.BeeLogger
 var bi *beegolog.BeeLogger
 
+// InitLog 初始化日志
 func InitLog(debug bool, ProcessID string, Logdir string, settings map[string]interface{}) {
 	beego = NewBeegoLogger(debug, ProcessID, Logdir, settings)
 }
+
+// InitBI 初始化BI日志
 func InitBI(debug bool, ProcessID string, Logdir string, settings map[string]interface{}) {
 	bi = NewBeegoLogger(debug, ProcessID, Logdir, settings)
 }
+
+// LogBeego LogBeego
 func LogBeego() *beegolog.BeeLogger {
 	if beego == nil {
 		beego = beegolog.NewLogger()
@@ -34,17 +41,20 @@ func LogBeego() *beegolog.BeeLogger {
 	return beego
 }
 
+// BiBeego BiBeego
 func BiBeego() *beegolog.BeeLogger {
 	return bi
 }
 
+// CreateRootTrace CreateRootTrace
 func CreateRootTrace() TraceSpan {
 	return &TraceSpanImp{
-		Trace: utils.GenerateID().String(),
-		Span:  utils.GenerateID().String(),
+		Trace: mqanttools.GenerateID().String(),
+		Span:  mqanttools.GenerateID().String(),
 	}
 }
 
+// CreateTrace CreateTrace
 func CreateTrace(trace, span string) TraceSpan {
 	return &TraceSpanImp{
 		Trace: trace,
@@ -52,6 +62,7 @@ func CreateTrace(trace, span string) TraceSpan {
 	}
 }
 
+// BiReport BiReport
 func BiReport(msg string) {
 	//gLogger.doPrintf(debugLevel, printDebugLevel, format, a...)
 	l := BiBeego()
@@ -60,25 +71,31 @@ func BiReport(msg string) {
 	}
 }
 
+// Debug Debug
 func Debug(format string, a ...interface{}) {
 	//gLogger.doPrintf(debugLevel, printDebugLevel, format, a...)
 	LogBeego().Debug(nil, format, a...)
 }
+
+// Info Info
 func Info(format string, a ...interface{}) {
 	//gLogger.doPrintf(releaseLevel, printReleaseLevel, format, a...)
 	LogBeego().Info(nil, format, a...)
 }
 
+// Error Error
 func Error(format string, a ...interface{}) {
 	//gLogger.doPrintf(errorLevel, printErrorLevel, format, a...)
 	LogBeego().Error(nil, format, a...)
 }
 
+// Warning Warning
 func Warning(format string, a ...interface{}) {
 	//gLogger.doPrintf(fatalLevel, printFatalLevel, format, a...)
 	LogBeego().Warning(nil, format, a...)
 }
 
+// TDebug TDebug
 func TDebug(span TraceSpan, format string, a ...interface{}) {
 	if span != nil {
 		LogBeego().Debug(
@@ -90,6 +107,8 @@ func TDebug(span TraceSpan, format string, a ...interface{}) {
 		LogBeego().Debug(nil, format, a...)
 	}
 }
+
+// TInfo TInfo
 func TInfo(span TraceSpan, format string, a ...interface{}) {
 	if span != nil {
 		LogBeego().Info(
@@ -102,6 +121,7 @@ func TInfo(span TraceSpan, format string, a ...interface{}) {
 	}
 }
 
+// TError TError
 func TError(span TraceSpan, format string, a ...interface{}) {
 	if span != nil {
 		LogBeego().Error(
@@ -114,6 +134,7 @@ func TError(span TraceSpan, format string, a ...interface{}) {
 	}
 }
 
+// TWarning TWarning
 func TWarning(span TraceSpan, format string, a ...interface{}) {
 	if span != nil {
 		LogBeego().Warning(
@@ -126,6 +147,7 @@ func TWarning(span TraceSpan, format string, a ...interface{}) {
 	}
 }
 
+// Close Close
 func Close() {
 	LogBeego().Close()
 }
