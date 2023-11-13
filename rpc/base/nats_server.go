@@ -15,7 +15,7 @@ package defaultrpc
 
 import (
 	"fmt"
-	"github.com/golang/protobuf/proto"
+	"google.golang.org/protobuf/proto"
 	"github.com/liangdas/mqant/log"
 	"github.com/liangdas/mqant/module"
 	"github.com/liangdas/mqant/rpc"
@@ -33,6 +33,7 @@ type NatsServer struct {
 	server    *RPCServer
 	done      chan bool
 	stopeds   chan bool
+	subs      *nats.Subscription
 	isClose   bool
 }
 
@@ -94,8 +95,11 @@ func (s *NatsServer) Shutdown() (err error) {
 	return
 }
 
-func (s *NatsServer) Callback(callinfo mqrpc.CallInfo) error {
-	body, _ := s.MarshalResult(callinfo.Result)
+func (s *NatsServer) Callback(callinfo *mqrpc.CallInfo) error {
+	body, err := s.MarshalResult(callinfo.Result)
+	if err != nil {
+		return err
+	}
 	reply_to := callinfo.Props["reply_to"].(string)
 	return s.app.Transport().Publish(reply_to, body)
 }
@@ -103,7 +107,7 @@ func (s *NatsServer) Callback(callinfo mqrpc.CallInfo) error {
 /**
 接收请求信息
 */
-func (s *NatsServer) on_request_handle() error {
+func (s *NatsServer) on_request_handle() (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			var rn = ""
@@ -121,7 +125,7 @@ func (s *NatsServer) on_request_handle() error {
 			fmt.Println(errstr)
 		}
 	}()
-	subs, err := s.app.Transport().SubscribeSync(s.addr)
+	s.subs, err = s.app.Transport().SubscribeSync(s.addr)
 	if err != nil {
 		return err
 	}
@@ -131,24 +135,40 @@ func (s *NatsServer) on_request_handle() error {
 		case <-s.done:
 			//服务关闭
 		}
-		subs.Unsubscribe()
+		s.subs.Unsubscribe()
 	}()
 
 	for !s.isClose {
-		m, err := subs.NextMsg(time.Minute)
+		m, err := s.subs.NextMsg(time.Minute)
 		if err != nil && err == nats.ErrTimeout {
 			//fmt.Println(err.Error())
 			//log.Warning("NatsServer error with '%v'",err)
+			if !s.subs.IsValid() {
+				//订阅已关闭，需要重新订阅
+				s.subs, err = s.app.Transport().SubscribeSync(s.addr)
+				if err != nil {
+					log.Error("NatsServer SubscribeSync[1] error with '%v'", err)
+					continue
+				}
+			}
 			continue
 		} else if err != nil {
 			log.Warning("NatsServer error with '%v'", err)
+			if !s.subs.IsValid() {
+				//订阅已关闭，需要重新订阅
+				s.subs, err = s.app.Transport().SubscribeSync(s.addr)
+				if err != nil {
+					log.Error("NatsServer SubscribeSync[2] error with '%v'", err)
+					continue
+				}
+			}
 			continue
 		}
 
 		rpcInfo, err := s.Unmarshal(m.Data)
 		if err == nil {
 			callInfo := &mqrpc.CallInfo{
-				RPCInfo: *rpcInfo,
+				RPCInfo: rpcInfo,
 			}
 			callInfo.Props = map[string]interface{}{
 				"reply_to": rpcInfo.ReplyTo,
@@ -156,7 +176,7 @@ func (s *NatsServer) on_request_handle() error {
 
 			callInfo.Agent = s //设置代理为NatsServer
 
-			s.server.Call(*callInfo)
+			s.server.Call(callInfo)
 		} else {
 			fmt.Println("error ", err)
 		}
@@ -179,8 +199,8 @@ func (s *NatsServer) Unmarshal(data []byte) (*rpcpb.RPCInfo, error) {
 }
 
 // goroutine safe
-func (s *NatsServer) MarshalResult(resultInfo rpcpb.ResultInfo) ([]byte, error) {
+func (s *NatsServer) MarshalResult(resultInfo *rpcpb.ResultInfo) ([]byte, error) {
 	//log.Error("",map2)
-	b, err := proto.Marshal(&resultInfo)
+	b, err := proto.Marshal(resultInfo)
 	return b, err
 }

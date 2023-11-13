@@ -15,7 +15,7 @@ package defaultrpc
 
 import (
 	"fmt"
-	"github.com/golang/protobuf/proto"
+	"google.golang.org/protobuf/proto"
 	"github.com/liangdas/mqant/log"
 	"github.com/liangdas/mqant/module"
 	"github.com/liangdas/mqant/rpc"
@@ -34,6 +34,7 @@ type NatsClient struct {
 	callbackqueueName string
 	app               module.App
 	done              chan error
+	subs              *nats.Subscription
 	isClose           bool
 	session           module.ServerSession
 }
@@ -54,7 +55,7 @@ func (c *NatsClient) Delete(key string) (err error) {
 	c.callinfos.Delete(key)
 	return
 }
-func (c *NatsClient) CloseFch(fch chan rpcpb.ResultInfo) {
+func (c *NatsClient) CloseFch(fch chan *rpcpb.ResultInfo) {
 	defer func() {
 		if recover() != nil {
 			// close(ch) panic occur
@@ -86,7 +87,7 @@ func (c *NatsClient) Done() (err error) {
 /**
 消息请求
 */
-func (c *NatsClient) Call(callInfo mqrpc.CallInfo, callback chan rpcpb.ResultInfo) error {
+func (c *NatsClient) Call(callInfo *mqrpc.CallInfo, callback chan *rpcpb.ResultInfo) error {
 	//var err error
 	if c.callinfos == nil {
 		return fmt.Errorf("AMQPClient is closed")
@@ -100,7 +101,7 @@ func (c *NatsClient) Call(callInfo mqrpc.CallInfo, callback chan rpcpb.ResultInf
 		timeout:        callInfo.RPCInfo.Expired,
 	}
 	c.callinfos.Set(correlation_id, *clinetCallInfo)
-	body, err := c.Marshal(&callInfo.RPCInfo)
+	body, err := c.Marshal(callInfo.RPCInfo)
 	if err != nil {
 		return err
 	}
@@ -110,8 +111,8 @@ func (c *NatsClient) Call(callInfo mqrpc.CallInfo, callback chan rpcpb.ResultInf
 /**
 消息请求 不需要回复
 */
-func (c *NatsClient) CallNR(callInfo mqrpc.CallInfo) error {
-	body, err := c.Marshal(&callInfo.RPCInfo)
+func (c *NatsClient) CallNR(callInfo *mqrpc.CallInfo) error {
+	body, err := c.Marshal(callInfo.RPCInfo)
 	if err != nil {
 		return err
 	}
@@ -121,7 +122,7 @@ func (c *NatsClient) CallNR(callInfo mqrpc.CallInfo) error {
 /**
 接收应答信息
 */
-func (c *NatsClient) on_request_handle() error {
+func (c *NatsClient) on_request_handle() (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			var rn = ""
@@ -139,25 +140,41 @@ func (c *NatsClient) on_request_handle() error {
 			fmt.Println(errstr)
 		}
 	}()
-	subs, err := c.app.Transport().SubscribeSync(c.callbackqueueName)
+	c.subs, err = c.app.Transport().SubscribeSync(c.callbackqueueName)
 	if err != nil {
 		return err
 	}
 
 	go func() {
 		<-c.done
-		subs.Unsubscribe()
+		c.subs.Unsubscribe()
 	}()
 
 	for !c.isClose {
-		m, err := subs.NextMsg(time.Minute)
+		m, err := c.subs.NextMsg(time.Minute)
 		if err != nil && err == nats.ErrTimeout {
 			//fmt.Println(err.Error())
 			//log.Warning("NatsServer error with '%v'",err)
+			if !c.subs.IsValid() {
+				//订阅已关闭，需要重新订阅
+				c.subs, err = c.app.Transport().SubscribeSync(c.callbackqueueName)
+				if err != nil {
+					log.Error("NatsClient SubscribeSync[1] error with '%v'", err)
+					continue
+				}
+			}
 			continue
 		} else if err != nil {
 			fmt.Println(fmt.Sprintf("%v rpcclient error: %v", time.Now().String(), err.Error()))
 			log.Error("NatsClient error with '%v'", err)
+			if !c.subs.IsValid() {
+				//订阅已关闭，需要重新订阅
+				c.subs, err = c.app.Transport().SubscribeSync(c.callbackqueueName)
+				if err != nil {
+					log.Error("NatsClient SubscribeSync[2] error with '%v'", err)
+					continue
+				}
+			}
 			continue
 		}
 
@@ -170,8 +187,10 @@ func (c *NatsClient) on_request_handle() error {
 			//删除
 			c.callinfos.Delete(correlation_id)
 			if clinetCallInfo != nil {
-				clinetCallInfo.(ClinetCallInfo).call <- *resultInfo
-				c.CloseFch(clinetCallInfo.(ClinetCallInfo).call)
+				if clinetCallInfo.(ClinetCallInfo).call != nil {
+					clinetCallInfo.(ClinetCallInfo).call <- resultInfo
+					c.CloseFch(clinetCallInfo.(ClinetCallInfo).call)
+				}
 			} else {
 				//可能客户端已超时了，但服务端处理完还给回调了
 				log.Warning("rpc callback no found : [%s]", correlation_id)

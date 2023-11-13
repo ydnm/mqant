@@ -20,17 +20,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"github.com/liangdas/mqant/conf"
-	"github.com/liangdas/mqant/log"
-	"github.com/liangdas/mqant/module"
-	"github.com/liangdas/mqant/module/base"
-	"github.com/liangdas/mqant/module/modules"
-	"github.com/liangdas/mqant/registry"
-	"github.com/liangdas/mqant/rpc"
-	"github.com/liangdas/mqant/selector"
-	"github.com/liangdas/mqant/selector/cache"
-	"github.com/nats-io/nats.go"
-	"github.com/pkg/errors"
+	basegate "github.com/liangdas/mqant/gate/base"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -39,6 +29,18 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/liangdas/mqant/conf"
+	"github.com/liangdas/mqant/log"
+	"github.com/liangdas/mqant/module"
+	basemodule "github.com/liangdas/mqant/module/base"
+	"github.com/liangdas/mqant/module/modules"
+	"github.com/liangdas/mqant/registry"
+	mqrpc "github.com/liangdas/mqant/rpc"
+	"github.com/liangdas/mqant/selector"
+	"github.com/liangdas/mqant/selector/cache"
+	"github.com/nats-io/nats.go"
+	"github.com/pkg/errors"
 )
 
 type resultInfo struct {
@@ -64,8 +66,16 @@ func newOptions(opts ...module.Option) module.Options {
 		RegisterInterval: time.Second * time.Duration(10),
 		RegisterTTL:      time.Second * time.Duration(20),
 		KillWaitTTL:      time.Second * time.Duration(60),
+		RPCExpired:       time.Second * time.Duration(10),
+		RPCMaxCoroutine:  0, //不限制
 		Debug:            true,
 		Parse:            true,
+		LogFileName: func(logdir, prefix, processID, suffix string) string {
+			return fmt.Sprintf("%s/%v%s%s", logdir, prefix, processID, suffix)
+		},
+		BIFileName: func(logdir, prefix, processID, suffix string) string {
+			return fmt.Sprintf("%s/%v%s%s", logdir, prefix, processID, suffix)
+		},
 	}
 
 	for _, o := range opts {
@@ -146,25 +156,16 @@ func newOptions(opts ...module.Option) module.Options {
 		}
 	}
 
-	_, err := os.Open(opt.ConfPath)
-	if err != nil {
-		//文件不存在
+	if _, err := os.Stat(opt.ConfPath); os.IsNotExist(err) {
 		panic(fmt.Sprintf("config path error %v", err))
 	}
-	_, err = os.Open(opt.LogDir)
-	if err != nil {
-		//文件不存在
-		err := os.Mkdir(opt.LogDir, os.ModePerm) //
-		if err != nil {
+	if _, err := os.Stat(opt.LogDir); os.IsNotExist(err) {
+		if err := os.Mkdir(opt.LogDir, os.ModePerm); err != nil {
 			fmt.Println(err)
 		}
 	}
-
-	_, err = os.Open(opt.BIDir)
-	if err != nil {
-		//文件不存在
-		err := os.Mkdir(opt.BIDir, os.ModePerm) //
-		if err != nil {
+	if _, err := os.Stat(opt.BIDir); os.IsNotExist(err) {
+		if err := os.Mkdir(opt.BIDir, os.ModePerm); err != nil {
 			fmt.Println(err)
 		}
 	}
@@ -200,24 +201,30 @@ type DefaultApp struct {
 
 // Run 运行应用
 func (app *DefaultApp) Run(mods ...module.Module) error {
-	f, err := os.Open(app.opts.ConfPath)
-	if err != nil {
-		//文件不存在
-		panic(fmt.Sprintf("config path error %v", err))
-	}
 	var cof conf.Config
 	fmt.Println("Server configuration path :", app.opts.ConfPath)
-	conf.LoadConfig(f.Name()) //加载配置文件
+	conf.LoadConfig(app.opts.ConfPath) //加载配置文件
 	cof = conf.Conf
 	app.Configure(cof) //解析配置信息
-	log.InitLog(app.opts.Debug, app.opts.ProcessID, app.opts.LogDir, cof.Log)
-	log.InitBI(app.opts.Debug, app.opts.ProcessID, app.opts.BIDir, cof.BI)
-
-	log.Info("mqant %v starting up", app.version)
 
 	if app.configurationLoaded != nil {
 		app.configurationLoaded(app)
 	}
+
+	app.AddRPCSerialize("gate", &basegate.SessionSerialize{
+		App: app,
+	})
+	// log.InitLog(app.opts.Debug, app.opts.ProcessID, app.opts.LogDir, cof.Log)
+	// log.InitBI(app.opts.Debug, app.opts.ProcessID, app.opts.BIDir, cof.BI)
+	log.Init(log.WithDebug(app.opts.Debug),
+		log.WithProcessID(app.opts.ProcessID),
+		log.WithBiDir(app.opts.BIDir),
+		log.WithLogDir(app.opts.LogDir),
+		log.WithLogFileName(app.opts.LogFileName),
+		log.WithBiSetting(cof.BI),
+		log.WithBIFileName(app.opts.BIFileName),
+		log.WithLogSetting(cof.Log))
+	log.Info("mqant %v starting up", app.opts.Version)
 
 	manager := basemodule.NewModuleManager()
 	manager.RegisterRunMod(modules.TimerModule()) //注册时间轮模块 每一个进程都默认运行
@@ -231,11 +238,13 @@ func (app *DefaultApp) Run(mods ...module.Module) error {
 	if app.startup != nil {
 		app.startup(app)
 	}
+	log.Info("mqant %v started", app.opts.Version)
 	// close
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt, os.Kill, syscall.SIGTERM)
 	sig := <-c
-
+	log.BiBeego().Flush()
+	log.LogBeego().Flush()
 	//如果一分钟都关不了则强制关闭
 	timeout := time.NewTimer(app.opts.KillWaitTTL)
 	wait := make(chan struct{})
@@ -249,6 +258,15 @@ func (app *DefaultApp) Run(mods ...module.Module) error {
 		panic(fmt.Sprintf("mqant close timeout (signal: %v)", sig))
 	case <-wait:
 		log.Info("mqant closing down (signal: %v)", sig)
+	}
+	log.BiBeego().Close()
+	log.LogBeego().Close()
+	return nil
+}
+
+func (app *DefaultApp) UpdateOptions(opts ...module.Option) error {
+	for _, o := range opts {
+		o(&app.opts)
 	}
 	return nil
 }

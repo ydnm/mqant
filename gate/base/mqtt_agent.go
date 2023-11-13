@@ -49,6 +49,7 @@ type agent struct {
 	client                       *mqtt.Client
 	ch                           chan int //控制模块可同时开启的最大协程数
 	isclose                      bool
+	protocol_ok                  bool
 	lock                         sync.Mutex
 	lastStorageHeartbeatDataTime time.Duration //上一次发送存储心跳时间
 	revNum                       int64
@@ -69,6 +70,7 @@ func (age *agent) OnInit(gate gate.Gate, conn network.Conn) error {
 	age.r = bufio.NewReaderSize(conn, gate.Options().BufSize)
 	age.w = bufio.NewWriterSize(conn, gate.Options().BufSize)
 	age.isclose = false
+	age.protocol_ok = false
 	age.revNum = 0
 	age.sendNum = 0
 	age.lastStorageHeartbeatDataTime = time.Duration(time.Now().UnixNano())
@@ -76,6 +78,10 @@ func (age *agent) OnInit(gate gate.Gate, conn network.Conn) error {
 }
 func (age *agent) IsClosed() bool {
 	return age.isclose
+}
+
+func (age *agent) ProtocolOK() bool {
+	return age.protocol_ok
 }
 
 func (age *agent) GetSession() gate.Session {
@@ -133,7 +139,7 @@ func (age *agent) Run() (err error) {
 	var pack *mqtt.Pack
 	pack, err = mqtt.ReadPack(age.r, age.gate.Options().MaxPackSize)
 	if err != nil {
-		log.Error("Read login pack error", err)
+		log.Error("Read login pack error %v", err)
 		return
 	}
 	if pack.GetType() != mqtt.CONNECT {
@@ -158,6 +164,11 @@ func (age *agent) Run() (err error) {
 		"Serverid":  age.module.GetServerID(),
 		"Settings":  make(map[string]string),
 	})
+	netConn, ok := age.conn.(*network.WSConn)
+	if ok {
+		//如果是websocket连接 提取 User-Agent
+		age.session.SetLocalKV("User-Agent", netConn.Conn().Request().Header.Get("User-Agent"))
+	}
 	if err != nil {
 		log.Error("gate create agent fail", err.Error())
 		return
@@ -167,9 +178,11 @@ func (age *agent) Run() (err error) {
 	//回复客户端 CONNECT
 	err = mqtt.WritePack(mqtt.GetConnAckPack(0), age.w)
 	if err != nil {
+		log.Error("ConnAckPack error %v", err.Error())
 		return
 	}
 	age.connTime = time.Now()
+	age.protocol_ok = true
 	age.gate.GetAgentLearner().Connect(age) //发送连接成功的事件
 	c.Listen_loop()                         //开始监听,直到连接中断
 	return nil
@@ -186,6 +199,10 @@ func (age *agent) OnClose() error {
 	age.isclose = true
 	age.gate.GetAgentLearner().DisConnect(age) //发送连接断开的事件
 	return nil
+}
+
+func (age *agent) GetError() error {
+	return age.client.GetError()
 }
 
 func (age *agent) RevNum() int64 {
@@ -225,8 +242,19 @@ func (age *agent) toResult(a *agent, Topic string, Result interface{}, Error str
 }
 
 func (age *agent) recoverworker(pack *mqtt.Pack) {
-	defer age.Finish()
 	defer func() {
+		age.lock.Lock()
+		interval := int64(age.lastStorageHeartbeatDataTime) + int64(age.gate.Options().Heartbeat) //单位纳秒
+		age.lock.Unlock()
+		if interval < time.Now().UnixNano() {
+			if age.gate.GetStorageHandler() != nil {
+				age.lock.Lock()
+				age.lastStorageHeartbeatDataTime = time.Duration(time.Now().UnixNano())
+				age.lock.Unlock()
+				age.gate.GetStorageHandler().Heartbeat(age.GetSession())
+			}
+		}
+		age.Finish()
 		if r := recover(); r != nil {
 			buff := make([]byte, 1024)
 			runtime.Stack(buff, false)
@@ -280,7 +308,7 @@ func (age *agent) recoverworker(pack *mqtt.Pack) {
 				}
 				return
 			}
-			if pub.GetMsg()[0] == '{' && pub.GetMsg()[len(pub.GetMsg())-1] == '}' {
+			if len(pub.GetMsg()) > 0 && pub.GetMsg()[0] == '{' && pub.GetMsg()[len(pub.GetMsg())-1] == '}' {
 				//尝试解析为json为map
 				var obj interface{} // var obj map[string]interface{}
 				err := json.Unmarshal(pub.GetMsg(), &obj)
@@ -305,7 +333,7 @@ func (age *agent) recoverworker(pack *mqtt.Pack) {
 					return
 				}
 				args[0] = b
-				ctx, _ := context.WithTimeout(context.TODO(), time.Second*3)
+				ctx, _ := context.WithTimeout(context.TODO(), age.module.GetApp().Options().RPCExpired)
 				result, e := serverSession.CallArgs(ctx, topics[1], ArgsType, args)
 				toResult(age, *pub.GetTopic(), result, e)
 			} else {
@@ -322,35 +350,21 @@ func (age *agent) recoverworker(pack *mqtt.Pack) {
 				}
 			}
 		}
-		//if age.GetSession().GetUserId() != "" {
-		//这个链接已经绑定Userid
-		age.lock.Lock()
-		interval := int64(age.lastStorageHeartbeatDataTime) + int64(age.gate.Options().Heartbeat) //单位纳秒
-		age.lock.Unlock()
-		if interval < time.Now().UnixNano() {
-			if age.gate.GetStorageHandler() != nil {
-				age.lock.Lock()
-				age.lastStorageHeartbeatDataTime = time.Duration(time.Now().UnixNano())
-				age.lock.Unlock()
-				age.gate.GetStorageHandler().Heartbeat(age.GetSession())
-			}
-		}
-		//}
 	case mqtt.PINGREQ:
 		//客户端发送的心跳包
 		//if age.GetSession().GetUserId() != "" {
 		//这个链接已经绑定Userid
-		age.lock.Lock()
-		interval := int64(age.lastStorageHeartbeatDataTime) + int64(age.gate.Options().Heartbeat) //单位纳秒
-		age.lock.Unlock()
-		if interval < time.Now().UnixNano() {
-			if age.gate.GetStorageHandler() != nil {
-				age.lock.Lock()
-				age.lastStorageHeartbeatDataTime = time.Duration(time.Now().UnixNano())
-				age.lock.Unlock()
-				age.gate.GetStorageHandler().Heartbeat(age.GetSession())
-			}
-		}
+		//age.lock.Lock()
+		//interval := int64(age.lastStorageHeartbeatDataTime) + int64(age.gate.Options().Heartbeat) //单位纳秒
+		//age.lock.Unlock()
+		//if interval < time.Now().UnixNano() {
+		//	if age.gate.GetStorageHandler() != nil {
+		//		age.lock.Lock()
+		//		age.lastStorageHeartbeatDataTime = time.Duration(time.Now().UnixNano())
+		//		age.lock.Unlock()
+		//		age.gate.GetStorageHandler().Heartbeat(age.GetSession())
+		//	}
+		//}
 		//}
 	}
 }
@@ -371,9 +385,12 @@ func (age *agent) WriteMsg(topic string, body []byte) error {
 }
 
 func (age *agent) Close() {
-	if age.conn != nil {
-		age.conn.Close()
-	}
+	go func() {
+		//关闭连接部分情况下会阻塞超时，因此放协程去处理
+		if age.conn != nil {
+			age.conn.Close()
+		}
+	}()
 }
 
 func (age *agent) Destroy() {
